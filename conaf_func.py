@@ -3,6 +3,8 @@ import numpy as np
 import math
 from tqdm.notebook import tqdm
 from scipy.optimize import curve_fit
+import networkx as nx
+import cartopy.crs as ccrs
 
 
 def dms_to_decimal(coord):
@@ -104,3 +106,132 @@ def C_q(coords, eps, q=2):
 
 def D_q(coords, eps=1, q=2):
     return np.log10(C_q(coords, eps, q=q))/np.log10(eps)
+
+
+# -------------- Creating Graph ------------ #
+
+def create_graph_map(lon_range = [], lat_range = [], cell_size=0.1):
+    """
+    Crea un grafo basado en una cuadrícula regular donde cada nodo es identificado
+    directamente por su tupla (lon_idx, lat_idx).
+
+    Parámetros:
+    ----------
+    lon_range : list o tuple
+        Rango de longitudes [min_lon, max_lon].
+    lat_range : list o tuple
+        Rango de latitudes [min_lat, max_lat].
+    cell_size : float
+        Tamaño de cada celda en grados.
+
+    Retorna:
+    -------
+    G : networkx.Graph
+        Grafo donde los nodos son identificados por tuplas (lon_idx, lat_idx),
+        y cada nodo tiene como atributo su posición central.
+    """
+    # Crear arrays para las coordenadas centrales de las celdas
+    min_lon, max_lon = lon_range
+    min_lat, max_lat = lat_range
+    lon_centers = np.arange(min_lon + cell_size / 2, max_lon, cell_size)
+    lat_centers = np.arange(min_lat + cell_size / 2, max_lat, cell_size)
+
+    # Crear un grafo vacío
+    G = nx.Graph()
+
+    # Agregar nodos con las posiciones centrales como atributos
+    for lat_idx, lat in enumerate(lat_centers):
+        for lon_idx, lon in enumerate(lon_centers):
+            G.add_node((lon_idx, lat_idx), position=(lon, lat))
+
+    return G
+
+
+def create_connected_graph_map(df, cell_size=0.1, lat_col="dLat", lon_col="dLon", date_col="Inicio"):
+    """
+    Crea un grafo basado en una cuadrícula y agrega conexiones entre nodos
+    según la secuencialidad de eventos en el dataframe.
+
+    Parámetros:
+    ----------
+    df : pandas.DataFrame
+        DataFrame con columnas 'lon', 'lat', y 'Inicio' (tiempo).
+    cell_size : float
+        Tamaño de cada celda en grados.
+
+    Retorna:
+    -------
+    G : networkx.Graph
+        Grafo con nodos representando celdas y conexiones entre nodos por eventos secuenciales.
+    """
+    # Calcular rangos de latitud y longitud automáticamente
+    min_lon, max_lon = df[lon_col].min(), df[lon_col].max()
+    min_lat, max_lat = df[lat_col].min(), df[lat_col].max()
+
+    # Ajustar los rangos para incluir completamente los extremos
+    lon_range = [min_lon - cell_size / 2, max_lon + cell_size / 2]
+    lat_range = [min_lat - cell_size / 2, max_lat + cell_size / 2]
+
+    # Crear el grafo base
+    G = create_graph_map(lon_range, lat_range, cell_size)
+
+    # Función auxiliar para asignar eventos a celdas
+    def assign_to_cell(lon, lat):
+        lon_idx = int((lon - lon_range[0]) // cell_size)
+        lat_idx = int((lat - lat_range[0]) // cell_size)
+        return (lon_idx, lat_idx)
+
+    # Agregar una columna con la celda correspondiente a cada evento
+    df['cell'] = df.apply(lambda row: assign_to_cell(row[lon_col], row[lat_col]), axis=1)
+
+    # Ordenar por tiempo para evaluar eventos secuenciales
+    df.sort_values(by=date_col, ascending=True, inplace=True)
+    df.reset_index(drop=True, inplace=True)
+
+    # Iterar por los eventos y conectar nodos
+    for i in range(len(df) - 1):
+        cell_current = df.loc[i, 'cell']
+        cell_next = df.loc[i + 1, 'cell']
+
+        # Conectar nodos si son distintos
+        if cell_current != cell_next:
+            G.add_edge(cell_current, cell_next)
+
+    return G
+
+
+def plot_graph_on_map(ax, G, base_size=5, pondered_size=5, edge_width=0.1, alpha_edge=0.2):
+    """
+    Plotea un grafo sobre un mapa usando las posiciones (lon, lat) de los nodos,
+    escalando el tamaño de los nodos según su grado. Excluye nodos sin conexiones.
+
+    Parámetros:
+    ----------
+    ax : matplotlib.axes._subplots.AxesSubplot
+        El eje del mapa donde se superpone el grafo.
+    G : networkx.Graph
+        El grafo a superponer, cuyos nodos tienen el atributo 'position' como (lon, lat).
+    """
+    # Filtrar nodos con grado mayor a 0
+    connected_nodes = [(node, degree) for node, degree in G.degree() if degree > 0]
+
+    # Iterar sobre nodos conectados para plotearlos
+    for node, degree in connected_nodes:
+        lon, lat = G.nodes[node]['position']
+
+        # Escalar el tamaño del nodo según su grado
+        node_size = base_size + degree * pondered_size # Tamaño base + escalamiento por grado
+
+        ax.scatter(
+            lon, lat,
+            s=node_size, color='red', edgecolor='black', zorder=5, transform=ccrs.PlateCarree()
+        )
+
+    # Iterar sobre edges para dibujarlos
+    for u, v in G.edges():
+        lon_u, lat_u = G.nodes[u]['position']
+        lon_v, lat_v = G.nodes[v]['position']
+        ax.plot(
+            [lon_u, lon_v], [lat_u, lat_v],
+            color='black', linewidth=edge_width, zorder=4, transform=ccrs.PlateCarree(), alpha=alpha_edge
+        )
